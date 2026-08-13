@@ -1,0 +1,15 @@
+{
+	"session_id": "3f0c1d54-6b21-4f88-9a2e-1c7d5b8e4a10",
+	"application_reference": "GRU-123101-2026",
+	"name": "Priya Raman",
+	"email": "priya.raman@example.com",
+	"gender": "female",
+	"date_of_birth": "1978-11-02",
+	"phone_number": "02079460000",
+	"address": {
+		"address_line_1": "12 Elm Court",
+		"address_line_2": "Leeds",
+		"postcode": "LS1 4DY",
+		"country": "United Kingdom"
+	}
+}

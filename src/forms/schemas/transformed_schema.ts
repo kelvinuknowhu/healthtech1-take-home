@@ -1,4 +1,4 @@
-type TransformedFormSchema = {
+export type TransformedFormSchema = {
 	sessionId: string;
 	applicationReference: string;
 	firstName: string;

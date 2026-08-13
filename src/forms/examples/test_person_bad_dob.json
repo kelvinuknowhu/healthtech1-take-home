@@ -1,0 +1,16 @@
+{
+	"session_id": "c1d8f3a6-2e77-4b05-91cc-0a5b6d29e8f4",
+	"application_reference": "GRU-123103-2026",
+	"name": "Tomas Novak",
+	"email": "tomas.novak@example.com",
+	"gender": "male",
+	"date_of_birth": "2023-02-30",
+	"phone_number": "01612345678",
+	"mobile_number": "07700900123",
+	"address": {
+		"address_line_1": "88 Riverside Walk",
+		"address_line_2": "Newcastle upon Tyne",
+		"postcode": "NE1 3AF",
+		"country": "United Kingdom"
+	}
+}
