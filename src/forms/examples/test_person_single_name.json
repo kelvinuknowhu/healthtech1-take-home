@@ -1,0 +1,15 @@
+{
+	"session_id": "9b4e7a02-58d3-42c6-8f19-6d0a3e5c77b1",
+	"application_reference": "GRU-123102-2026",
+	"name": "Madonna",
+	"email": "madonna@example.com",
+	"gender": "female",
+	"date_of_birth": "1958-08-16",
+	"mobile_number": "07911123456",
+	"address": {
+		"address_line_1": "4 Prince Street",
+		"address_line_2": "Manchester",
+		"postcode": "M1 1AE",
+		"country": "United Kingdom"
+	}
+}
