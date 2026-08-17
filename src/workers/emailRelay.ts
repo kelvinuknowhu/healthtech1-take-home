@@ -55,7 +55,10 @@ const scheduleEmailRetry = async (
 	error: string,
 ): Promise<EmailOutcome> => {
 	const log = logger.child({ emailId: email.id, formId: email.formId });
-	const attempts = email.attempts + 1;
+	// Already incremented by claimDueEmails - the count is spent at claim time so
+	// that a crash between here and there still burns it. Adding one again would
+	// charge this failure twice.
+	const attempts = email.attempts;
 	const dead = attempts >= config.worker.maxAttempts;
 
 	await repo.rescheduleEmail(email.id, email.formId, {

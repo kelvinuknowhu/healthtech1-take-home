@@ -68,16 +68,16 @@ formsRouter.get("/forms/:id", asyncHandler(async (req: Request, res: Response) =
 		return;
 	}
 
-	const [transformed, outbox, events] = await Promise.all([
+	const [transformed, email, events] = await Promise.all([
 		repo.getTransformedFormByFormId(form.id),
-		repo.getOutboxByFormId(form.id),
+		repo.getEmailOutboxByFormId(form.id),
 		repo.getFormEvents(form.id),
 	]);
 
 	res.status(200).json({
 		form,
 		transformed: transformed ?? null,
-		email: outbox ?? null,
+		email: email ?? null,
 		events,
 	});
 }));

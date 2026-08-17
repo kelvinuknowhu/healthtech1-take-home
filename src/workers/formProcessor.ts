@@ -11,9 +11,23 @@ import { processForm, type ProcessOutcome } from "../forms/service";
  * single tick without waiting for timers.
  */
 export const processDueForms = async (limit: number = config.worker.batchSize): Promise<ProcessOutcome[]> => {
-	const reclaimed = await repo.reclaimStaleProcessing();
+	const reclaimed = await repo.reclaimStaleProcessingForms();
 	if (reclaimed.length > 0) {
-		logger.warn({ count: reclaimed.length }, "reclaimed forms stranded by a crashed worker");
+		const deadLettered = reclaimed.filter((form) => form.status === "DEAD_LETTER");
+		logger.warn(
+			{ count: reclaimed.length, deadLettered: deadLettered.length },
+			"reclaimed forms stranded by a crashed worker",
+		);
+
+		// Distinct from the warn above: these have now exhausted their budget
+		// purely through crashes, which usually means one payload is killing the
+		// worker rather than the provider being flaky.
+		if (deadLettered.length > 0) {
+			logger.error(
+				{ formIds: deadLettered.map((form) => form.id) },
+				"forms dead-lettered after repeatedly crashing the worker",
+			);
+		}
 	}
 
 	const claimed = await repo.claimDueForms(limit);
