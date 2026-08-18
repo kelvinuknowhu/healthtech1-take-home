@@ -228,7 +228,7 @@ const handleProcessingFailure = async (form: FormRow, error: unknown): Promise<P
 	 */
 	const claim: repo.ClaimFence = { status: form.status, claimedAt: form.claimedAt };
 
-	const lostClaim = (): ProcessOutcome => {
+	const claimLost = (): ProcessOutcome => {
 		log.warn(
 			{ errorCode: pipelineError.code, claimedAt: form.claimedAt },
 			"claim lost while processing - discarding the outcome, the row has already been reclaimed",
@@ -244,7 +244,7 @@ const handleProcessingFailure = async (form: FormRow, error: unknown): Promise<P
 			detail,
 			claim,
 		});
-		if (!written) return lostClaim();
+		if (!written) return claimLost();
 
 		await repo.recordEvent(db, {
 			formId: form.id,
@@ -265,7 +265,7 @@ const handleProcessingFailure = async (form: FormRow, error: unknown): Promise<P
 			detail,
 			claim,
 		});
-		if (!written) return lostClaim();
+		if (!written) return claimLost();
 
 		await repo.recordEvent(db, {
 			formId: form.id,
@@ -285,7 +285,7 @@ const handleProcessingFailure = async (form: FormRow, error: unknown): Promise<P
 		detail,
 		claim,
 	});
-	if (!written) return lostClaim();
+	if (!written) return claimLost();
 
 	await repo.recordEvent(db, {
 		formId: form.id,

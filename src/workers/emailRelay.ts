@@ -20,6 +20,17 @@ export type EmailOutcome = "sent" | "retry_scheduled" | "dead_lettered";
  * real provider you would pass an idempotency key to collapse the duplicate.
  */
 export const sendPendingEmails = async (limit: number = config.worker.batchSize): Promise<EmailOutcome[]> => {
+	// Park first, claim second - the same shape as processDueForms. Rows stranded
+	// by a crashed relay are the oldest in the queue, so leaving them in the claim
+	// window would let them spend the batch limit and cost the tick its sends.
+	const parked = await repo.parkExhaustedEmails();
+	if (parked.length > 0) {
+		logger.error(
+			{ count: parked.length, formIds: parked.map((email) => email.formId) },
+			"emails dead-lettered after a relay repeatedly died before recording a send",
+		);
+	}
+
 	const due = await repo.claimDueEmails(limit);
 	if (due.length === 0) return [];
 

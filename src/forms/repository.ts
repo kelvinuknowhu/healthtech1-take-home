@@ -1,4 +1,4 @@
-import { and, count, desc, eq, inArray, isNull, lte, sql, type SQL } from "drizzle-orm";
+import { and, count, desc, eq, gte, inArray, isNull, lt, lte, sql, type SQL } from "drizzle-orm";
 import { config } from "../config";
 import { db, type Executor } from "../db/client";
 import {
@@ -224,7 +224,7 @@ export type ClaimFence = { status: FormStatus; claimedAt: Date | null };
 const stillHeld = (claim: ClaimFence): SQL =>
 	and(
 		eq(forms.status, claim.status),
-		// `is not distinct from` rather than `=`: claimed_at is null on the
+		// use `is not distinct from` rather than `=` as claimed_at is null on the
 		// direct-processing path, and null = null is not true.
 		sql`${forms.claimedAt} is not distinct from ${claim.claimedAt}`,
 	) as SQL;
@@ -447,53 +447,33 @@ export const retryForms = async (selector: RetrySelector): Promise<FormRow[]> =>
  *
  * The trade is that `attempts` now means "times we handed this to a worker"
  * rather than "times a send failed", so a restart mid-batch burns an attempt
- * from an email. That is the right way round: an
- * over-counted attempt costs one delayed notification and the nightly sweep
- * revives it, while an under-counted one wedges the relay permanently.
+ * from an email. That is the right way round: an over-counted attempt costs one
+ * delayed notification and the nightly sweep revives it, while an under-counted
+ * one wedges the relay permanently.
  */
 export const claimDueEmails = async (limit: number): Promise<EmailOutboxRow[]> =>
 	db.transaction(async (tx) => {
 		const due = await tx
-			.select({ id: emailOutbox.id, formId: emailOutbox.formId, attempts: emailOutbox.attempts })
+			.select({ id: emailOutbox.id })
 			.from(emailOutbox)
-			.where(and(eq(emailOutbox.status, "PENDING"), lte(emailOutbox.nextAttemptAt, new Date())))
+			.where(
+				and(
+					eq(emailOutbox.status, "PENDING"),
+					lte(emailOutbox.nextAttemptAt, new Date()),
+					// Exhausted rows are parked by parkExhaustedEmails, not here. Keeping
+					// them out of the window matters because they sort to the front of it:
+					// a stranded row's next_attempt_at stops moving while healthy rows are
+					// pushed forward by backoff. Filtered in the query rather than after
+					// it, so a pile of dead rows cannot spend the limit and leave the tick
+					// with nothing to send.
+					lt(emailOutbox.attempts, config.worker.maxAttempts),
+				),
+			)
 			.orderBy(emailOutbox.nextAttemptAt)
 			.limit(limit)
 			.for("update", { skipLocked: true });
 
 		if (due.length === 0) return [];
-
-		/**
-		 * A PENDING row already at the limit spent its whole budget without ever
-		 * reporting an outcome. Because the code that dead-letters lives in the relay that keeps dying, 
-		 * nothing downstream will ever park it either. 
-		 * So the claim function has to be the one to give up on it.
-		 */
-		const exhausted = due.filter((row) => row.attempts >= config.worker.maxAttempts);
-
-		if (exhausted.length > 0) {
-			await tx
-				.update(emailOutbox)
-				.set({ status: "DEAD_LETTER", lastError: "worker crashed before the send could be recorded" })
-				.where(
-					inArray(
-						emailOutbox.id,
-						exhausted.map((row) => row.id),
-					),
-				);
-
-			for (const row of exhausted) {
-				await recordEvent(tx, {
-					formId: row.formId,
-					eventType: "DEAD_LETTERED",
-					errorCode: "EMAIL_WORKER_CRASHED",
-					detail: { attempts: row.attempts, reason: "repeatedly stranded by a crashing relay" },
-				});
-			}
-		}
-
-		const claimable = due.filter((row) => row.attempts < config.worker.maxAttempts);
-		if (claimable.length === 0) return [];
 
 		// Pushing next_attempt_at out acts as a visibility timeout: another
 		// worker won't grab the same email while this one is mid-send.
@@ -506,10 +486,53 @@ export const claimDueEmails = async (limit: number): Promise<EmailOutboxRow[]> =
 			.where(
 				inArray(
 					emailOutbox.id,
-					claimable.map((row) => row.id),
+					due.map((row) => row.id),
 				),
 			)
 			.returning();
+	});
+
+/**
+ * Parks emails whose budget was spent without any outcome ever being recorded.
+ *
+ * The relay dead-letters from inside its own catch block, so a row that was
+ * claimed and then lost to a crash is never parked by anything downstream - the
+ * code that would do it lives in the relay that keeps dying. This is the pass
+ * that gives up on those, and it is the mirror of reclaimStaleProcessingForms
+ * on the form side: park what the last tick abandoned, then claim.
+ *
+ * Still gated on next_attempt_at, which is what separates "abandoned" from "in
+ * flight": a row claimed a moment ago is also at the limit, but its visibility
+ * timeout has not expired and a relay may be mid-send on it right now.
+ */
+export const parkExhaustedEmails = async (): Promise<EmailOutboxRow[]> =>
+	db.transaction(async (tx) => {
+		// A plain UPDATE is enough for concurrency: two relays running this at once
+		// serialise on the row locks, and the second re-evaluates the predicate
+		// against the committed version, which is no longer PENDING. RETURNING
+		// therefore yields each row to exactly one caller, so the events cannot double up.
+		const parked = await tx
+			.update(emailOutbox)
+			.set({ status: "DEAD_LETTER", lastError: "worker crashed before the send could be recorded" })
+			.where(
+				and(
+					eq(emailOutbox.status, "PENDING"),
+					gte(emailOutbox.attempts, config.worker.maxAttempts),
+					lte(emailOutbox.nextAttemptAt, new Date()),
+				),
+			)
+			.returning();
+
+		for (const row of parked) {
+			await recordEvent(tx, {
+				formId: row.formId,
+				eventType: "DEAD_LETTERED",
+				errorCode: "EMAIL_WORKER_CRASHED",
+				detail: { attempts: row.attempts, reason: "repeatedly stranded by a crashing relay" },
+			});
+		}
+
+		return parked;
 	});
 
 export const markEmailSent = async (id: string, formId: string): Promise<void> => {
