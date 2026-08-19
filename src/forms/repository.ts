@@ -460,12 +460,7 @@ export const claimDueEmails = async (limit: number): Promise<EmailOutboxRow[]> =
 				and(
 					eq(emailOutbox.status, "PENDING"),
 					lte(emailOutbox.nextAttemptAt, new Date()),
-					// Exhausted rows are parked by parkExhaustedEmails, not here. Keeping
-					// them out of the window matters because they sort to the front of it:
-					// a stranded row's next_attempt_at stops moving while healthy rows are
-					// pushed forward by backoff. Filtered in the query rather than after
-					// it, so a pile of dead rows cannot spend the limit and leave the tick
-					// with nothing to send.
+					// Skip exhausted rows here so the limit only fetches healthy ones
 					lt(emailOutbox.attempts, config.worker.maxAttempts),
 				),
 			)
