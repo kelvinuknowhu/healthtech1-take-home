@@ -12,7 +12,7 @@ import app from "../src/app";
 import { db } from "../src/db/client";
 import { emailOutbox, forms, transformedForms } from "../src/db/schema";
 import * as repo from "../src/forms/repository";
-import { ingestForm, processFormById } from "../src/forms/service";
+import { ingestForm, processForm, processFormById } from "../src/forms/service";
 import { lookupPostcode } from "../src/providers/idealpostcodes";
 import { sendEmail } from "../src/providers/sendgrid";
 import { sendPendingEmails, type EmailOutcome } from "../src/workers/emailRelay";
@@ -172,7 +172,7 @@ describe("the happy path", () => {
 		const transformed = await repo.getTransformedFormByFormId(formId);
 		expect(transformed).toMatchObject({ firstName: "John", lastName: "Doe", longitude: 50.05, latitude: -5.05 });
 
-		const email = await repo.getOutboxByFormId(formId);
+		const email = await repo.getEmailOutboxByFormId(formId);
 		expect(email).toMatchObject({ status: "PENDING", toAddress: "happyforms@bots.com" });
 	});
 
@@ -220,7 +220,7 @@ describe("the happy path", () => {
 
 	it("keeps patient identifiers out of the notification email", async () => {
 		const { formId } = await ingestAndProcess(validForm());
-		const email = await repo.getOutboxByFormId(formId);
+		const email = await repo.getEmailOutboxByFormId(formId);
 
 		// Internal "a form arrived" ping - email is a poor place to keep PII.
 		expect(email?.body).not.toContain("John Doe");
@@ -345,7 +345,7 @@ describe("the guaranteed email (transactional outbox)", () => {
 
 		expect(await sendPendingEmails()).toEqual(["sent"]);
 
-		const email = await repo.getOutboxByFormId(formId);
+		const email = await repo.getEmailOutboxByFormId(formId);
 		expect(email).toMatchObject({ status: "SENT" });
 		expect(email?.sentAt).not.toBeNull();
 	});
@@ -387,7 +387,7 @@ describe("the guaranteed email (transactional outbox)", () => {
 
 		// The budget is spent one attempt at a time, and only the last one gives up.
 		expect(outcomes).toEqual([["retry_scheduled"], ["retry_scheduled"], ["dead_lettered"]]);
-		expect((await repo.getOutboxByFormId(formId))?.status).toBe("DEAD_LETTER");
+		expect((await repo.getEmailOutboxByFormId(formId))?.status).toBe("DEAD_LETTER");
 		// The form itself transformed fine; only the notification failed.
 		expect((await repo.getFormById(formId))?.status).toBe("READY");
 	});
@@ -499,6 +499,47 @@ describe("the nightly sweep", () => {
 		expect((await repo.getFormById(form.id))?.status).toBe("READY");
 	});
 
+	/**
+	 * Worth being explicit about, because it bounds the crash-loop guarantee: the
+	 * sweep resets `attempts` to zero, and it cannot tell a form parked by three
+	 * crashes from one parked by a provider outage. So "three crashes and it
+	 * parks" is a per-sweep bound, not an absolute one.
+	 */
+	it("gives a crash-parked form a fresh budget, so the crash bound is nightly rather than absolute", async () => {
+		const { form } = await ingestForm(validForm());
+
+		const crashThreeTimes = async () => {
+			for (let i = 0; i < 3; i++) {
+				await db
+					.update(forms)
+					.set({ status: "PROCESSING", claimedAt: new Date(Date.now() - 120_000) })
+					.where(eq(forms.id, form.id));
+				await repo.reclaimStaleProcessingForms();
+			}
+		};
+
+		await crashThreeTimes();
+		expect(await repo.getFormById(form.id)).toMatchObject({
+			status: "DEAD_LETTER",
+			attempts: 3,
+			lastErrorCode: "WORKER_CRASHED",
+		});
+
+		expect((await sweepParkedWork()).deadLetteredForms).toBe(1);
+		expect(await repo.getFormById(form.id)).toMatchObject({ status: "PENDING", attempts: 0 });
+
+		// So a payload that still kills the worker burns a full budget again
+		// tonight - and, because the batch is processed concurrently, takes an
+		// attempt off every healthy form it was claimed alongside.
+		await crashThreeTimes();
+		expect(await repo.getFormById(form.id)).toMatchObject({ status: "DEAD_LETTER", attempts: 3 });
+
+		// The trade it buys: once the cause is gone, the form heals unattended.
+		expect((await sweepParkedWork()).deadLetteredForms).toBe(1);
+		expect(await processDueForms()).toEqual(["ready"]);
+		expect((await repo.getFormById(form.id))?.status).toBe("READY");
+	});
+
 	it("retries dead-lettered emails", async () => {
 		const { formId } = await ingestAndProcess(validForm());
 		mockSendEmail.mockResolvedValue(emailFail);
@@ -508,14 +549,14 @@ describe("the nightly sweep", () => {
 			outcomes = await sendPendingEmails();
 		}
 		expect(outcomes).toEqual(["dead_lettered"]);
-		expect((await repo.getOutboxByFormId(formId))?.status).toBe("DEAD_LETTER");
+		expect((await repo.getEmailOutboxByFormId(formId))?.status).toBe("DEAD_LETTER");
 
 		mockSendEmail.mockResolvedValue(emailOk);
 		expect((await sweepParkedWork()).deadLetteredEmails).toBe(1);
 
 		// Claimable again after the sweep - a dead letter is parked, not lost.
 		expect(await sendPendingEmails()).toEqual(["sent"]);
-		expect((await repo.getOutboxByFormId(formId))?.status).toBe("SENT");
+		expect((await repo.getEmailOutboxByFormId(formId))?.status).toBe("SENT");
 	});
 });
 
@@ -575,6 +616,208 @@ describe("crash recovery", () => {
 		await processDueForms();
 
 		expect((await repo.getFormById(form.id))?.status).toBe("READY");
+	});
+
+	/**
+	 * The regression these two guard against: `attempts` used to be incremented
+	 * only inside the service's own catch block, which a crash skips by
+	 * definition. A payload that killed the worker was therefore reclaimed at the
+	 * same count forever, and because both claims order by next_attempt_at, the stuck record sat
+	 * at the head of every batch - so the queue could stop draining entirely.
+	 */
+	it("counts an attempt each time it reclaims, so a crash loop cannot run forever", async () => {
+		const { form } = await ingestForm(validForm());
+
+		// A worker that claims the row and dies before its error handler runs.
+		const strandInProcessing = () =>
+			db
+				.update(forms)
+				.set({ status: "PROCESSING", claimedAt: new Date(Date.now() - 120_000) })
+				.where(eq(forms.id, form.id));
+
+		// MAX_ATTEMPTS is 3 in tests, so the third crash exhausts the budget.
+		await strandInProcessing();
+		await repo.reclaimStaleProcessingForms();
+		expect(await repo.getFormById(form.id)).toMatchObject({ status: "PENDING", attempts: 1 });
+
+		await strandInProcessing();
+		await repo.reclaimStaleProcessingForms();
+		expect(await repo.getFormById(form.id)).toMatchObject({ status: "PENDING", attempts: 2 });
+
+		await strandInProcessing();
+		await repo.reclaimStaleProcessingForms();
+		expect(await repo.getFormById(form.id)).toMatchObject({ status: "DEAD_LETTER", attempts: 3 });
+
+		const events = await repo.getFormEvents(form.id);
+		expect(events.map((event) => event.eventType)).toEqual(
+			expect.arrayContaining(["RECLAIMED_STALE", "DEAD_LETTERED"]),
+		);
+	});
+
+	it("counts the email attempt at claim time, so a crashing relay cannot retry forever", async () => {
+		const { formId } = await ingestAndProcess(validForm());
+
+		// A relay that claims the row and dies mid-send: the claim runs, the
+		// outcome never does.
+		const makeDue = () =>
+			db
+				.update(emailOutbox)
+				.set({ nextAttemptAt: new Date(Date.now() - 1_000) })
+				.where(eq(emailOutbox.formId, formId));
+
+		for (const expectedAttempts of [1, 2, 3]) {
+			await makeDue();
+			expect(await repo.claimDueEmails(10)).toHaveLength(1);
+			expect((await repo.getEmailOutboxByFormId(formId))?.attempts).toBe(expectedAttempts);
+		}
+
+		await makeDue();
+		// Budget is spent and will be excluded from the due emails
+		expect(await repo.claimDueEmails(10)).toEqual([]);
+		// Exhausted emails are identified and parked
+		expect(await repo.parkExhaustedEmails()).toHaveLength(1);
+		expect((await repo.getEmailOutboxByFormId(formId))?.status).toBe("DEAD_LETTER");
+		expect(mockSendEmail).not.toHaveBeenCalled();
+	});
+
+	it("leaves an in-flight email alone, even once its budget is spent", async () => {
+		const { formId } = await ingestAndProcess(validForm());
+
+		await db
+			.update(emailOutbox)
+			.set({ nextAttemptAt: new Date(Date.now() - 1_000), attempts: 2 })
+			.where(eq(emailOutbox.formId, formId));
+
+		// A relay claims it: attempts hits the limit, but this send is happening
+		// right now and its visibility timeout has not expired.
+		expect(await repo.claimDueEmails(10)).toHaveLength(1);
+
+		// Parking on the count alone would dead-letter an email mid-send.
+		expect(await repo.parkExhaustedEmails()).toEqual([]);
+		expect((await repo.getEmailOutboxByFormId(formId))?.status).toBe("PENDING");
+	});
+
+	it("counts a failed send exactly once, now that the claim also counts", async () => {
+		const { formId } = await ingestAndProcess(validForm());
+		mockSendEmail.mockResolvedValueOnce(emailFail);
+
+		expect(await sendPendingEmails()).toEqual(["retry_scheduled"]);
+		expect((await repo.getEmailOutboxByFormId(formId))?.attempts).toBe(1);
+	});
+
+	it("does not let one crash-looping email block the rest of the queue", async () => {
+		const poison = await ingestAndProcess(validForm());
+		const healthy = await ingestAndProcess(validForm());
+
+		const poisonToHeadOfQueue = () =>
+			db
+				.update(emailOutbox)
+				.set({ nextAttemptAt: new Date(Date.now() - 10_000) })
+				.where(eq(emailOutbox.formId, poison.formId));
+
+		// Spend the first email's budget without ever recording an outcome.
+		for (let i = 0; i < 3; i++) {
+			await poisonToHeadOfQueue();
+			await repo.claimDueEmails(1);
+		}
+
+		// A batch size of one makes the head-of-line effect visible: the poison row
+		// is the oldest in the queue, so it is what a limit of one would see. The
+		// tick parks it before claiming and still sends the healthy email behind
+		// it, rather than spending the batch on a row it can never deliver.
+		await poisonToHeadOfQueue();
+		expect(await sendPendingEmails(1)).toEqual(["sent"]);
+		expect((await repo.getEmailOutboxByFormId(poison.formId))?.status).toBe("DEAD_LETTER");
+		expect((await repo.getEmailOutboxByFormId(healthy.formId))?.status).toBe("SENT");
+	});
+
+	/**
+	 * The other half of counting attempts at reclaim time: a lease says only that
+	 * a worker has gone quiet, not that it has died. These two pin down what
+	 * happens when it was merely slow and comes back after the row was reclaimed.
+	 */
+	const staleClaim = () => new Date(Date.now() - 120_000);
+
+	it("discards the failed outcome of a worker that turned out to be slow, not dead", async () => {
+		const { form } = await ingestForm(validForm());
+
+		// A worker claims the row and then stalls - a provider call with no
+		// timeout, say. Nothing hands the row back; the lease just expires under it.
+		await repo.claimDueForms(1);
+		await db.update(forms).set({ claimedAt: staleClaim() }).where(eq(forms.id, form.id));
+		const inFlight = (await repo.getFormById(form.id))!;
+		expect(inFlight).toMatchObject({ status: "PROCESSING", attempts: 0 });
+
+		// Three leases go by while it is still hung. Each expiry is reclaimed and
+		// picked up by another worker, and the third exhausts the budget.
+		for (let i = 0; i < 3; i++) {
+			await db
+				.update(forms)
+				.set({ status: "PROCESSING", claimedAt: staleClaim() })
+				.where(eq(forms.id, form.id));
+			await repo.reclaimStaleProcessingForms();
+		}
+		expect(await repo.getFormById(form.id)).toMatchObject({ status: "DEAD_LETTER", attempts: 3 });
+
+		// The original worker finally returns with a failure, holding a snapshot
+		// from before any of that. Writing it back unconditionally would resurrect
+		// the dead letter as PENDING and rewind attempts to 1 - undoing the exact
+		// bound the reclaim increment exists to enforce - so it is discarded.
+		mockLookupPostcode.mockResolvedValue(geocodeFail);
+		expect(await processForm(inFlight)).toBe("claim_lost");
+		expect(await repo.getFormById(form.id)).toMatchObject({
+			status: "DEAD_LETTER",
+			attempts: 3,
+			lastErrorCode: "WORKER_CRASHED",
+		});
+	});
+
+	it("keeps the work of a slow worker that succeeds after its form was parked", async () => {
+		const { form } = await ingestForm(validForm());
+
+		await repo.claimDueForms(1);
+		await db.update(forms).set({ claimedAt: staleClaim() }).where(eq(forms.id, form.id));
+		const inFlight = (await repo.getFormById(form.id))!;
+
+		// Still hung three leases later, so the reclaimer parks it. Nothing else
+		// will touch the row now: DEAD_LETTER is invisible to the claim.
+		for (let i = 0; i < 3; i++) {
+			await db
+				.update(forms)
+				.set({ status: "PROCESSING", claimedAt: staleClaim() })
+				.where(eq(forms.id, form.id));
+			await repo.reclaimStaleProcessingForms();
+		}
+		expect(await repo.getFormById(form.id)).toMatchObject({ status: "DEAD_LETTER", attempts: 3 });
+
+		// And then it returns - successfully. A finished transform is real work, so
+		// unlike a failure it is allowed to land on a parked row. Fencing this
+		// write too would throw the transform away and leave a form that is done
+		// sitting in DEAD_LETTER until the nightly sweep runs it all again.
+		expect(await processForm(inFlight)).toBe("ready");
+		expect((await repo.getFormById(form.id))?.status).toBe("READY");
+		expect(await db.select().from(transformedForms).where(eq(transformedForms.formId, form.id))).toHaveLength(1);
+		expect(await db.select().from(emailOutbox).where(eq(emailOutbox.formId, form.id))).toHaveLength(1);
+	});
+
+	it("commits once when a reclaimed form is finished by both workers", async () => {
+		const { form } = await ingestForm(validForm());
+
+		await repo.claimDueForms(1);
+		await db.update(forms).set({ claimedAt: staleClaim() }).where(eq(forms.id, form.id));
+		const inFlight = (await repo.getFormById(form.id))!;
+
+		// Reclaimed and transformed by a second worker while the first is still out.
+		await repo.reclaimStaleProcessingForms();
+		expect(await processDueForms()).toEqual(["ready"]);
+
+		// Now both of them have transformed the same form. The unique constraints
+		// are what make the second commit a no-op rather than a duplicate row for
+		// the FORM-BOT or a second notification email.
+		expect(await processForm(inFlight)).toBe("ready");
+		expect((await repo.getFormById(form.id))?.status).toBe("READY");
+		expect(await db.select().from(transformedForms).where(eq(transformedForms.formId, form.id))).toHaveLength(1);
+		expect(await db.select().from(emailOutbox).where(eq(emailOutbox.formId, form.id))).toHaveLength(1);
 	});
 });
 

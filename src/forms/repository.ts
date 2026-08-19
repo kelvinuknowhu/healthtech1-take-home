@@ -1,4 +1,4 @@
-import { and, count, desc, eq, inArray, isNull, lte, sql, type SQL } from "drizzle-orm";
+import { and, count, desc, eq, gte, inArray, isNull, lt, lte, sql, type SQL } from "drizzle-orm";
 import { config } from "../config";
 import { db, type Executor } from "../db/client";
 import {
@@ -94,7 +94,7 @@ export const getTransformedFormByFormId = async (formId: string): Promise<Transf
 	return row;
 };
 
-export const getOutboxByFormId = async (formId: string): Promise<EmailOutboxRow | undefined> => {
+export const getEmailOutboxByFormId = async (formId: string): Promise<EmailOutboxRow | undefined> => {
 	const [row] = await db.select().from(emailOutbox).where(eq(emailOutbox.formId, formId)).limit(1);
 	return row;
 };
@@ -139,8 +139,17 @@ export const claimDueForms = async (limit: number): Promise<FormRow[]> =>
  * Returns forms abandoned by a worker that crashed mid-processing to the
  * PENDING pool. Without this, a hard kill would strand rows in PROCESSING
  * forever.
+ *
+ * The attempt is counted *here*, not only in handleProcessingFailure. That
+ * matters: `attempts` exists to stop infinite retries, but the service only
+ * increments it from inside its own catch block - and a crash is precisely the
+ * case that skips the catch. Without this increment a payload that reliably
+ * kills the worker (an OOM during transform, say) is reclaimed at the same
+ * count forever, and because the claim orders by next_attempt_at it stays at
+ * the head of every batch. The queue would stop draining entirely rather than
+ * merely failing to dead-letter one row.
  */
-export const reclaimStaleProcessing = async (
+export const reclaimStaleProcessingForms = async (
 	leaseMs: number = config.worker.processingLeaseMs,
 ): Promise<FormRow[]> => {
 	const cutoff = new Date(Date.now() - leaseMs);
@@ -152,16 +161,43 @@ export const reclaimStaleProcessing = async (
 	const reclaimed = await db.transaction(async (tx) => {
 		const rows = await tx
 			.update(forms)
-			.set({ status: "PENDING", claimedAt: null, updatedAt: new Date() })
+			.set({
+				// Decided in SQL against the row's live value rather than in JS, so
+				// the read and the write cannot disagree under concurrency.
+				status: sql`case
+					when ${forms.attempts} + 1 >= ${config.worker.maxAttempts} then 'DEAD_LETTER'::form_status
+					else 'PENDING'::form_status
+				end`,
+				attempts: sql`${forms.attempts} + 1`,
+				claimedAt: null,
+				// next_attempt_at is deliberately left alone: it is already in the
+				// past, so a form stranded by an ordinary deploy restart resumes on
+				// the next tick instead of serving a backoff it did not earn.
+				lastErrorCode: "WORKER_CRASHED",
+				lastErrorDetail: { claimedBefore: cutoff.toISOString() },
+				updatedAt: new Date(),
+			})
 			.where(and(eq(forms.status, "PROCESSING"), lte(forms.claimedAt, cutoff)))
 			.returning();
 
 		for (const form of rows) {
+			// RETURNING yields post-update values, so these are the new count and
+			// the state the row actually landed in.
 			await recordEvent(tx, {
 				formId: form.id,
 				eventType: "RECLAIMED_STALE",
-				detail: { claimedBefore: cutoff.toISOString() },
+				errorCode: "WORKER_CRASHED",
+				detail: { claimedBefore: cutoff.toISOString(), attempts: form.attempts },
 			});
+
+			if (form.status === "DEAD_LETTER") {
+				await recordEvent(tx, {
+					formId: form.id,
+					eventType: "DEAD_LETTERED",
+					errorCode: "WORKER_CRASHED",
+					detail: { attempts: form.attempts, reason: "repeatedly stranded by a crashing worker" },
+				});
+			}
 		}
 
 		return rows;
@@ -170,12 +206,39 @@ export const reclaimStaleProcessing = async (
 	return reclaimed;
 };
 
-/** Transient failure: back to the queue with a later next_attempt_at. */
+/**
+ * The row as the worker found it. A failure write only lands if the row still
+ * looks like this.
+ *
+ * Reclaiming is driven by a lease, and a lease says nothing about whether the
+ * worker is dead - only that it has been quiet. A worker that is merely slow (a
+ * provider call with no timeout, a long GC pause) still holds a snapshot from
+ * before the reclaim, and writing it back unconditionally would rewind
+ * `attempts` and resurrect a row that was just dead-lettered, which is exactly
+ * the bound the reclaim increment exists to enforce. Same compare-and-set
+ * reasoning as retryForms: restate the predicate so Postgres re-evaluates it
+ * against the latest row version.
+ */
+export type ClaimFence = { status: FormStatus; claimedAt: Date | null };
+
+const stillHeld = (claim: ClaimFence): SQL =>
+	and(
+		eq(forms.status, claim.status),
+		// use `is not distinct from` rather than `=` as claimed_at is null on the
+		// direct-processing path, and null = null is not true.
+		sql`${forms.claimedAt} is not distinct from ${claim.claimedAt}`,
+	) as SQL;
+
+/**
+ * Transient failure: back to the queue with a later next_attempt_at.
+ *
+ * Returns false when the claim was lost and the write was discarded.
+ */
 export const rescheduleForm = async (
 	formId: string,
-	options: { attempts: number; nextAttemptAt: Date; errorCode: string; detail: unknown },
-): Promise<void> => {
-	await db
+	options: { attempts: number; nextAttemptAt: Date; errorCode: string; detail: unknown; claim: ClaimFence },
+): Promise<boolean> => {
+	const written = await db
 		.update(forms)
 		.set({
 			status: "PENDING",
@@ -186,7 +249,10 @@ export const rescheduleForm = async (
 			lastErrorDetail: options.detail as object,
 			updatedAt: new Date(),
 		})
-		.where(eq(forms.id, formId));
+		.where(and(eq(forms.id, formId), stillHeld(options.claim)))
+		.returning({ id: forms.id });
+
+	return written.length > 0;
 };
 
 /**
@@ -195,13 +261,15 @@ export const rescheduleForm = async (
  * FAILED_VALIDATION and DEAD_LETTER are both terminal, but they mean different
  * things: the first needs a code change, the second needs the outage to end.
  * Both are revived only by /retry or the sweeper.
+ *
+ * Fenced like rescheduleForm, and returns false when the write was discarded.
  */
 export const parkForm = async (
 	formId: string,
 	status: Extract<FormStatus, "FAILED_VALIDATION" | "DEAD_LETTER">,
-	options: { attempts: number; errorCode: string; detail: unknown },
-): Promise<void> => {
-	await db
+	options: { attempts: number; errorCode: string; detail: unknown; claim: ClaimFence },
+): Promise<boolean> => {
+	const written = await db
 		.update(forms)
 		.set({
 			status,
@@ -211,7 +279,10 @@ export const parkForm = async (
 			lastErrorDetail: options.detail as object,
 			updatedAt: new Date(),
 		})
-		.where(eq(forms.id, formId));
+		.where(and(eq(forms.id, formId), stillHeld(options.claim)))
+		.returning({ id: forms.id });
+
+	return written.length > 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -237,6 +308,12 @@ export type CompleteFormInput = {
  *
  * `onConflictDoNothing` on both inserts makes the whole operation idempotent, so
  * a replay of an already-completed form is a no-op rather than a duplicate.
+ *
+ * Deliberately *not* fenced on the claim, unlike the failure writes. A worker
+ * whose lease expired mid-transform still did the work correctly, and the
+ * unique constraints make committing it twice harmless - throwing that away to
+ * honour a reclaim would turn a slow provider call into a lost form. Only the
+ * writes that could rewind the retry budget need the fence.
  */
 export const completeForm = async (input: CompleteFormInput): Promise<void> => {
 	await db.transaction(async (tx) => {
@@ -359,12 +436,34 @@ export const retryForms = async (selector: RetrySelector): Promise<FormRow[]> =>
 // Email outbox relay
 // ---------------------------------------------------------------------------
 
+/**
+ * Claims due emails, counting the attempt as part of the claim.
+ *
+ * Incrementing here rather than only in scheduleEmailRetry is what makes the
+ * retry budget crash-proof. The relay increments from inside its catch, so a
+ * worker killed mid-send (deploy, OOM, liveness probe) never records the
+ * attempt - and since the claim orders by next_attempt_at, that row returns to
+ * the head of the queue a lease later at the same count, forever.
+ *
+ * The trade is that `attempts` now means "times we handed this to a worker"
+ * rather than "times a send failed", so a restart mid-batch burns an attempt
+ * from an email. That is the right way round: an over-counted attempt costs one
+ * delayed notification and the nightly sweep revives it, while an under-counted
+ * one wedges the relay permanently.
+ */
 export const claimDueEmails = async (limit: number): Promise<EmailOutboxRow[]> =>
 	db.transaction(async (tx) => {
 		const due = await tx
 			.select({ id: emailOutbox.id })
 			.from(emailOutbox)
-			.where(and(eq(emailOutbox.status, "PENDING"), lte(emailOutbox.nextAttemptAt, new Date())))
+			.where(
+				and(
+					eq(emailOutbox.status, "PENDING"),
+					lte(emailOutbox.nextAttemptAt, new Date()),
+					// Skip exhausted rows here so the limit only fetches healthy ones
+					lt(emailOutbox.attempts, config.worker.maxAttempts),
+				),
+			)
 			.orderBy(emailOutbox.nextAttemptAt)
 			.limit(limit)
 			.for("update", { skipLocked: true });
@@ -375,7 +474,10 @@ export const claimDueEmails = async (limit: number): Promise<EmailOutboxRow[]> =
 		// worker won't grab the same email while this one is mid-send.
 		return tx
 			.update(emailOutbox)
-			.set({ nextAttemptAt: new Date(Date.now() + 60_000) })
+			.set({
+				attempts: sql`${emailOutbox.attempts} + 1`,
+				nextAttemptAt: new Date(Date.now() + config.worker.processingLeaseMs),
+			})
 			.where(
 				inArray(
 					emailOutbox.id,
@@ -383,6 +485,49 @@ export const claimDueEmails = async (limit: number): Promise<EmailOutboxRow[]> =
 				),
 			)
 			.returning();
+	});
+
+/**
+ * Parks emails whose budget was spent without any outcome ever being recorded.
+ *
+ * The relay dead-letters from inside its own catch block, so a row that was
+ * claimed and then lost to a crash is never parked by anything downstream - the
+ * code that would do it lives in the relay that keeps dying. This is the pass
+ * that gives up on those, and it is the mirror of reclaimStaleProcessingForms
+ * on the form side: park what the last tick abandoned, then claim.
+ *
+ * Still gated on next_attempt_at, which is what separates "abandoned" from "in
+ * flight": a row claimed a moment ago is also at the limit, but its visibility
+ * timeout has not expired and a relay may be mid-send on it right now.
+ */
+export const parkExhaustedEmails = async (): Promise<EmailOutboxRow[]> =>
+	db.transaction(async (tx) => {
+		// A plain UPDATE is enough for concurrency: two relays running this at once
+		// serialise on the row locks, and the second re-evaluates the predicate
+		// against the committed version, which is no longer PENDING. RETURNING
+		// therefore yields each row to exactly one caller, so the events cannot double up.
+		const parked = await tx
+			.update(emailOutbox)
+			.set({ status: "DEAD_LETTER", lastError: "worker crashed before the send could be recorded" })
+			.where(
+				and(
+					eq(emailOutbox.status, "PENDING"),
+					gte(emailOutbox.attempts, config.worker.maxAttempts),
+					lte(emailOutbox.nextAttemptAt, new Date()),
+				),
+			)
+			.returning();
+
+		for (const row of parked) {
+			await recordEvent(tx, {
+				formId: row.formId,
+				eventType: "DEAD_LETTERED",
+				errorCode: "EMAIL_WORKER_CRASHED",
+				detail: { attempts: row.attempts, reason: "repeatedly stranded by a crashing relay" },
+			});
+		}
+
+		return parked;
 	});
 
 export const markEmailSent = async (id: string, formId: string): Promise<void> => {

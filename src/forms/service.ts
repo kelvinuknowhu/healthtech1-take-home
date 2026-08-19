@@ -106,7 +106,7 @@ const geocode = async (postcode: string): Promise<Coordinates> => {
 // Processing
 // ---------------------------------------------------------------------------
 
-export type ProcessOutcome = "ready" | "retry_scheduled" | "failed_validation" | "dead_lettered";
+export type ProcessOutcome = "ready" | "retry_scheduled" | "failed_validation" | "dead_lettered" | "claim_lost";
 
 const eventTypeForError = (code: string): FormEventType => {
 	if (code === "SCHEMA_VALIDATION_FAILED" || code === "NAME_UNSPLITTABLE" || code === "INVALID_DATE_OF_BIRTH") {
@@ -220,13 +220,32 @@ const handleProcessingFailure = async (form: FormRow, error: unknown): Promise<P
 	const attempts = form.attempts + 1;
 	const detail = { message: pipelineError.message, ...(pipelineError.detail as object | undefined) };
 
+	/**
+	 * Every write below is conditional on the row still being as we claimed it.
+	 * If the lease expired while this form was in flight, the reclaimer has
+	 * already counted the attempt and decided what happens next - our snapshot is
+	 * stale, and writing it back would undo that decision.
+	 */
+	const claim: repo.ClaimFence = { status: form.status, claimedAt: form.claimedAt };
+
+	const claimLost = (): ProcessOutcome => {
+		log.warn(
+			{ errorCode: pipelineError.code, claimedAt: form.claimedAt },
+			"claim lost while processing - discarding the outcome, the row has already been reclaimed",
+		);
+		return "claim_lost";
+	};
+
 	if (pipelineError instanceof PermanentError) {
 		// Will fail identically forever. Park it and wait for a human.
-		await repo.parkForm(form.id, "FAILED_VALIDATION", {
+		const written = await repo.parkForm(form.id, "FAILED_VALIDATION", {
 			attempts,
 			errorCode: pipelineError.code,
 			detail,
+			claim,
 		});
+		if (!written) return claimLost();
+
 		await repo.recordEvent(db, {
 			formId: form.id,
 			eventType: eventTypeForError(pipelineError.code),
@@ -240,7 +259,14 @@ const handleProcessingFailure = async (form: FormRow, error: unknown): Promise<P
 	const exhausted = attempts >= config.worker.maxAttempts;
 
 	if (exhausted) {
-		await repo.parkForm(form.id, "DEAD_LETTER", { attempts, errorCode: pipelineError.code, detail });
+		const written = await repo.parkForm(form.id, "DEAD_LETTER", {
+			attempts,
+			errorCode: pipelineError.code,
+			detail,
+			claim,
+		});
+		if (!written) return claimLost();
+
 		await repo.recordEvent(db, {
 			formId: form.id,
 			eventType: "DEAD_LETTERED",
@@ -252,12 +278,15 @@ const handleProcessingFailure = async (form: FormRow, error: unknown): Promise<P
 	}
 
 	const retryAt = nextAttemptAt(attempts);
-	await repo.rescheduleForm(form.id, {
+	const written = await repo.rescheduleForm(form.id, {
 		attempts,
 		nextAttemptAt: retryAt,
 		errorCode: pipelineError.code,
 		detail,
+		claim,
 	});
+	if (!written) return claimLost();
+
 	await repo.recordEvent(db, {
 		formId: form.id,
 		eventType: eventTypeForError(pipelineError.code),

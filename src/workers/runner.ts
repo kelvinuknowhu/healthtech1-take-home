@@ -56,7 +56,7 @@ export const startWorkers = (): void => {
 	];
 
 	logger.info(
-		{ intervalMs: config.worker.intervalMs, sweepIntervalMs: config.sweeper.intervalMs },
+		{ workerIntervalMs: config.worker.intervalMs, sweepIntervalMs: config.sweeper.intervalMs },
 		"background workers started",
 	);
 };
